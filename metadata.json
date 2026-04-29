@@ -1,0 +1,6 @@
+{
+  "name": "FastAPI Backend Project",
+  "description": "A production-ready FastAPI project structure with CORS, health checks, and document processing dependencies.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -1,11 +1,31 @@
-<div align="center">
+# FastAPI Backend Project
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+This project provides a robust starting point for a Python-based backend using FastAPI.
 
-  <h1>Built with AI Studio</h2>
+## Features
+- **FastAPI**: Modern, fast (high-performance) web framework.
+- **CORS Configured**: Ready to communicate with a React frontend on `http://localhost:3000`.
+- **Health Check**: `/ping` endpoint for status monitoring.
+- **Auto-Documentation**: Swagger UI available at `/docs`.
+- **Dependency Stack**: Includes `pandas`, `python-docx`, and `PyMuPDF` for document and data processing.
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Setup Instructions
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+1. **Create a Virtual Environment**:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-</div>
+2. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Run the Server**:
+   ```bash
+   python main.py
+   ```
+
+4. **Access Documentation**:
+   Visit `http://localhost:3000/docs` in your browser.
