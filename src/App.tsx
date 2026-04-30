@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useCallback } from "react";
+import React, { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
   Upload, 
@@ -27,13 +27,16 @@ type Language = {
 const LANGUAGES: Language[] = [
   { code: "en", name: "English", native: "English" },
   { code: "ne", name: "Nepali", native: "नेपाली" },
-  { code: "taj", name: "Tamang", native: "तामाङ" },
+  { code: "tmg", name: "Tamang", native: "तामाङ" },
 ];
 
 export default function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [sourceLang, setSourceLang] = useState<string>("en");
   const [targetLang, setTargetLang] = useState<string>("ne");
   const [isTranslating, setIsTranslating] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [statusText, setStatusText] = useState("");
   const [result, setResult] = useState<{ url: string; name: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,6 +52,8 @@ export default function App() {
       setSelectedFile(f);
       setError(null);
       setResult(null);
+      setProgress(0);
+      setStatusText("");
     } else {
       setError("Please upload a .csv, .docx, or .pdf file.");
     }
@@ -56,35 +61,84 @@ export default function App() {
 
   /**
    * Handles the file upload and translation request.
-   * Maps /api/ to the FastAPI backend running on port 8000.
    */
   const handleUpload = async () => {
     if (!selectedFile) return;
 
     setIsTranslating(true);
     setError(null);
+    setProgress(0);
+    setStatusText("Initializing engine...");
 
     const formData = new FormData();
     formData.append("file", selectedFile);
     formData.append("target_lang", targetLang);
-    formData.append("source_lang", "en");
+    formData.append("source_lang", sourceLang);
 
     const extension = selectedFile.name.split('.').pop()?.toLowerCase();
     const endpoint = `/api/translate/${extension}`;
 
     try {
-      const response = await fetch(endpoint, {
+      // 1. Start the job
+      const triggerResponse = await fetch(endpoint, {
         method: "POST",
         body: formData,
       });
 
-      if (!response.ok) throw new Error("Translation failed on the server.");
+      if (!triggerResponse.ok) {
+        const errorData = await triggerResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || errorData.details || "Failed to start translation.");
+      }
+
+      const { jobId } = await triggerResponse.json();
+
+      // 2. Listen to SSE for progress
+      const eventSource = new EventSource(`/api/jobs/progress/${jobId}`);
+
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.error) {
+          setError(data.error);
+          eventSource.close();
+          setIsTranslating(false);
+          return;
+        }
+
+        setProgress(data.progress);
+        setStatusText(data.status);
+
+        if (data.progress === 100 && data.status === "Complete") {
+          eventSource.close();
+          finishJob(jobId);
+        }
+      };
+
+      eventSource.onerror = () => {
+        console.error("SSE connection lost");
+        eventSource.close();
+        // Don't throw error immediately, we can try to finalize or the server might still be working
+      };
+
+    } catch (err: any) {
+      setError(err.message || "An unexpected error occurred.");
+      setIsTranslating(false);
+    }
+  };
+
+  const finishJob = async (jobId: string) => {
+    try {
+      const downloadUrl = `/api/jobs/download/${jobId}`;
+      const response = await fetch(downloadUrl);
+      
+      if (!response.ok) throw new Error("Could not download translated file.");
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
-      const translatedName = `translated_${selectedFile.name}`;
+      const translatedName = `translated_${selectedFile?.name}`;
       
       setResult({ url, name: translatedName });
+      setIsTranslating(false);
 
       // Automatically trigger download
       const link = document.createElement('a');
@@ -93,10 +147,8 @@ export default function App() {
       document.body.appendChild(link);
       link.click();
       link.remove();
-      
     } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-    } finally {
+      setError(err.message);
       setIsTranslating(false);
     }
   };
@@ -166,23 +218,45 @@ export default function App() {
             {/* Form Section */}
             <div className="space-y-8">
               {/* Language Selection */}
-              <div>
-                <label className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-3 block">Target Language</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {LANGUAGES.map((lang) => (
-                    <button
-                      key={lang.code}
-                      onClick={() => setTargetLang(lang.code)}
-                      className={`py-3 px-2 rounded-xl border transition-all ${
-                        targetLang === lang.code 
-                        ? 'bg-indigo-500/10 border-indigo-500 text-white shadow-lg shadow-indigo-500/10' 
-                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
-                      }`}
-                    >
-                      <div className="text-xs font-bold">{lang.native}</div>
-                      <div className="text-[10px] uppercase opacity-50">{lang.name}</div>
-                    </button>
-                  ))}
+              <div className="space-y-6">
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-3 block">Source Language</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {LANGUAGES.map((lang) => (
+                      <button
+                        key={`src-${lang.code}`}
+                        onClick={() => setSourceLang(lang.code)}
+                        className={`py-3 px-2 rounded-xl border transition-all ${
+                          sourceLang === lang.code 
+                          ? 'bg-indigo-500/10 border-indigo-500 text-white shadow-lg shadow-indigo-500/10' 
+                          : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                        }`}
+                      >
+                        <div className="text-xs font-bold">{lang.native}</div>
+                        <div className="text-[10px] uppercase opacity-50">{lang.name}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-3 block">Target Language</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {LANGUAGES.map((lang) => (
+                      <button
+                        key={`tgt-${lang.code}`}
+                        onClick={() => setTargetLang(lang.code)}
+                        className={`py-3 px-2 rounded-xl border transition-all ${
+                          targetLang === lang.code 
+                          ? 'bg-indigo-500/10 border-indigo-500 text-white shadow-lg shadow-indigo-500/10' 
+                          : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                        }`}
+                      >
+                        <div className="text-xs font-bold">{lang.native}</div>
+                        <div className="text-[10px] uppercase opacity-50">{lang.name}</div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -241,27 +315,55 @@ export default function App() {
 
               {/* Action Button */}
               {!result ? (
-                <button
-                  disabled={!selectedFile || isTranslating}
-                  onClick={handleUpload}
-                  className={`w-full py-4 rounded-2xl font-bold flex items-center justify-center gap-2 transition-all ${
-                    !selectedFile || isTranslating
-                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                    : 'bg-white text-slate-900 hover:bg-indigo-400 hover:translate-y-[-2px] active:translate-y-0'
-                  }`}
-                >
-                  {isTranslating ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      Translating Engine...
-                    </>
-                  ) : (
-                    <>
-                      Translate Document
-                      <ArrowRight className="w-5 h-5" />
-                    </>
+                <div className="space-y-4">
+                  <button
+                    disabled={!selectedFile || isTranslating}
+                    onClick={handleUpload}
+                    className={`w-full py-4 rounded-2xl font-bold flex items-center justify-center gap-2 transition-all ${
+                      !selectedFile || isTranslating
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-white text-slate-900 hover:bg-indigo-400 hover:translate-y-[-2px] active:translate-y-0'
+                    }`}
+                  >
+                    {isTranslating ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        {statusText}
+                      </>
+                    ) : (
+                      <>
+                        Translate Document
+                        <ArrowRight className="w-5 h-5" />
+                      </>
+                    )}
+                  </button>
+                  
+                  {isTranslating && (
+                    <div className="space-y-3 pt-2">
+                      <div className="flex justify-between items-center text-[10px] uppercase tracking-wider font-extrabold text-slate-500">
+                        <span className="flex items-center gap-2">
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                          </span>
+                          Processing Engine
+                        </span>
+                        <span className="text-indigo-400">{Math.round(progress)}%</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden border border-slate-700/50">
+                        <motion.div 
+                          className="h-full bg-gradient-to-r from-indigo-500 to-sky-400"
+                          initial={{ width: 0 }}
+                          animate={{ width: `${progress}%` }}
+                          transition={{ duration: 0.5, ease: "easeOut" }}
+                        />
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-medium italic text-center">
+                        {statusText}
+                      </div>
+                    </div>
                   )}
-                </button>
+                </div>
               ) : (
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-emerald-400">
