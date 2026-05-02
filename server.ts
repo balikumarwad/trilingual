@@ -1,6 +1,7 @@
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdfParsePackage = require("pdf-parse");
+import "regenerator-runtime/runtime.js";
 
 import express from "express";
 import { createServer as createViteServer } from "vite";
@@ -9,8 +10,21 @@ import multer from "multer";
 import { parse as parseCsv } from "csv-parse/sync";
 import { stringify as stringifyCsv } from "csv-stringify/sync";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
-import axios from "axios";
+import fontkit from "@pdf-lib/fontkit";
 import { v4 as uuidv4 } from "uuid";
+import { GoogleGenAI } from "@google/genai";
+import axios from "axios";
+
+let aiClient: GoogleGenAI | null = null;
+function getAI() {
+  if (!aiClient) {
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error("GEMINI_API_KEY environment variable is required.");
+    }
+    aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  }
+  return aiClient;
+}
 
 // Job Store for SSE
 interface TranslationJob {
@@ -43,52 +57,53 @@ function updateJob(id: string, updates: Partial<TranslationJob>) {
         id: updated.id
       })}\n\n`);
     }
+
+    // Fallback cleanup to prevent memory leaks if client disconnects
+    if (updated.progress === 100 || updated.status === 'Failed') {
+      setTimeout(() => {
+        jobs.delete(id);
+        const cli = clients.get(id);
+        if (cli) cli.end();
+        clients.delete(id);
+      }, 30 * 60 * 1000); // 30 minutes to claim result
+    }
   }
 }
 
-// Configuration for Real TMT API
-const API_URL = "https://tmt.ilprl.ku.edu.np/lang-translate";
-const API_TOKEN = "team_0c4cf201a499ccad";
-
 /**
- * Real translation logic using Axios
+ * Advanced Script-based AI Translation using Gemini
  */
 const translateText = async (text: string, source_lang: string, target_lang: string): Promise<string> => {
   if (!text || typeof text !== 'string' || !text.trim()) return text;
   
+  const langMap: Record<string, string> = {
+    'en': 'English',
+    'ne': 'Nepali',
+    'tmg': 'Tamang'
+  };
+
+  const srcLib = langMap[source_lang] || source_lang;
+  const tgtLib = langMap[target_lang] || target_lang;
+
   try {
-    const payload = {
-      text: text.trim(),
-      src_lang: source_lang,
-      tgt_lang: target_lang
-    };
+    const prompt = `You are a professional linguistic translation engine. Translate the following text from ${srcLib} to ${tgtLib}. 
+    Only output the accurately translated text. Do not include quotes, markdown formatting, or any extra explanation.
     
-    const response = await axios.post(API_URL, payload, {
-      headers: {
-        "Authorization": `Bearer ${API_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      timeout: 20000 
+    Text to translate:
+    ${text}`;
+
+    const response = await getAI().models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt
     });
 
-    console.log(`[TMT] Chunk: "${text.substring(0, 30)}..." -> Status: ${response.status}`);
-    
-      if (response.data && typeof response.data === 'object') {
-        const data = response.data;
-        // Handle both message_type and message type (observed inconsistency in KU API)
-        const msgType = data.message_type || data['message type'];
-        const output = data.output || data.translated_text;
-
-        if (msgType === 'SUCCESS' && output) {
-          return output;
-        }
-        
-        // Final fallback to output if it exists regardless of status
-        if (output) return output;
-      }
+    if (response.text) {
+      return response.text.trim();
+    }
+    return text;
   } catch (error: any) {
-    console.error("[TMT Error]:", error.response?.status, error.message);
-    return text; 
+    console.error(`[Gemini Neural Translation Error]:`, error.message);
+    return text; // Fallback to original text if translation fails
   }
 };
 
@@ -101,8 +116,8 @@ let latinFontBuffer: Uint8Array | null = null;
 async function preloadFonts() {
   try {
     const urls = {
-      devanagari: "https://raw.githubusercontent.com/googlefonts/noto-fonts/master/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf",
-      latin: "https://raw.githubusercontent.com/googlefonts/noto-fonts/master/hinted/ttf/NotoSans/NotoSans-Regular.ttf"
+      devanagari: "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf",
+      latin: "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf"
     };
     
     console.log("[Font] Pre-loading fonts (timeout 60s)...");
@@ -125,7 +140,10 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json());
-  const upload = multer({ storage: multer.memoryStorage() });
+  const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit to prevent DoS
+  });
 
   // SSE Endpoint for progress tracking
   app.get("/api/jobs/progress/:jobId", (req, res) => {
@@ -165,8 +183,11 @@ async function startServer() {
     res.setHeader("Content-Disposition", `attachment; filename=translated_${job.fileName}`);
     res.end(job.result);
     
-    // Optionally cleanup
-    // setTimeout(() => jobs.delete(jobId), 60000);
+    // Cleanup memory 5 minutes after download is available, or right after download
+    setTimeout(() => {
+      jobs.delete(jobId);
+      clients.delete(jobId);
+    }, 5 * 60 * 1000);
   });
 
   // Unified translation trigger endpoint
@@ -212,17 +233,41 @@ async function startServer() {
     const csvContent = file.buffer.toString();
     const records = parseCsv(csvContent, { columns: true, skip_empty_lines: true, relax_column_count: true });
     
+    // Safety limit to prevent runaway requests
+    const safeRecords = records.slice(0, 100); 
     const translatedRecords = [];
-    for (let i = 0; i < records.length; i++) {
-      const row = records[i];
-      const newRow: any = {};
-      for (const [key, value] of Object.entries(row)) {
-        newRow[key] = await translateText(value as string, sourceLang, targetLang);
-      }
-      translatedRecords.push(newRow);
+    
+    for (let i = 0; i < safeRecords.length; i++) {
+      const row = safeRecords[i];
+      let newRow: any = Object.assign({}, row);
       
-      const p = 10 + Math.floor((i / records.length) * 80);
-      updateJob(jobId, { status: `Translating rows (${i + 1}/${records.length})...`, progress: p });
+      try {
+        const textToTranslate = JSON.stringify(row);
+        // Specialized prompt for objects
+        const prompt = `Translate the VALUES of this JSON object from ${sourceLang} to ${targetLang}, but keep the KEYS exactly as they are in English. Return ONLY the raw valid JSON object without markdown formatting:\n${textToTranslate}`;
+        
+        const response = await getAI().models.generateContent({
+           model: "gemini-2.5-flash",
+           contents: prompt
+        });
+        
+        if (response.text) {
+           let cleaned = response.text.trim();
+           if (cleaned.startsWith("\`\`\`json")) cleaned = cleaned.replace(/^\`\`\`json/,"").replace(/\`\`\`$/,"").trim();
+           const parsed = JSON.parse(cleaned);
+           if (typeof parsed === "object" && parsed !== null) {
+              newRow = parsed;
+           }
+        }
+      } catch (err) {
+        console.warn("[CSV Translation Row Fallback]");
+      }
+      
+      translatedRecords.push(newRow);
+      await sleep(1000); // 1 second delay between rows
+      
+      const p = 10 + Math.floor((i / safeRecords.length) * 80);
+      updateJob(jobId, { status: `Translating rows (${i + 1}/${safeRecords.length})...`, progress: p });
     }
 
     const output = stringifyCsv(translatedRecords, { header: true });
@@ -237,31 +282,38 @@ async function startServer() {
   async function processPdfJob(jobId: string, file: any, sourceLang: string, targetLang: string) {
     updateJob(jobId, { status: "Extracting PDF content...", progress: 5 });
     
-    let parseFunc: any = pdfParsePackage;
-    
-    // Exhaustive check for the function in different module systems
-    if (typeof parseFunc !== "function") {
-      if (parseFunc && typeof parseFunc.default === "function") {
-        parseFunc = parseFunc.default;
-      } else if (parseFunc && typeof parseFunc.pdf === "function") {
-        parseFunc = parseFunc.pdf;
-      }
-    }
-    
-    if (typeof parseFunc !== "function") {
-      console.error("[PDF Error] pdf-parse resolution failed. Type:", typeof pdfParsePackage, "Keys:", Object.keys(pdfParsePackage || {}));
-      throw new Error("The PDF processing engine failed to initialize. Please try again later.");
-    }
-
-    let data;
+    let extractedText = "";
     try {
-      data = await parseFunc(file.buffer);
+      if (pdfParsePackage && typeof pdfParsePackage.PDFParse === "function") {
+        // pdf-parse v2+ (e.g. 2.4.5)
+        const parser = new pdfParsePackage.PDFParse({ data: file.buffer });
+        const data = await parser.getText();
+        extractedText = data.text;
+        await parser.destroy();
+      } else {
+        // legacy pdf-parse v1
+        let parseFunc: any = pdfParsePackage;
+        if (typeof parseFunc !== "function") {
+          if (parseFunc && typeof parseFunc.default === "function") {
+            parseFunc = parseFunc.default;
+          } else if (parseFunc && typeof parseFunc.pdf === "function") {
+            parseFunc = parseFunc.pdf;
+          }
+        }
+        
+        if (typeof parseFunc === "function") {
+          const data = await parseFunc(file.buffer);
+          extractedText = data?.text || "";
+        } else {
+          console.error("[PDF Error] pdf-parse resolution failed. Type:", typeof pdfParsePackage, "Keys:", Object.keys(pdfParsePackage || {}));
+          throw new Error("The PDF processing engine failed to initialize. Please try again later.");
+        }
+      }
     } catch (extractErr: any) {
       console.error("[PDF Extraction Error]:", extractErr.message);
       throw new Error(`Failed to extract text from PDF: ${extractErr.message}`);
     }
 
-    const extractedText = data?.text;
     if (!extractedText || !extractedText.trim()) {
       throw new Error("No readable text found in the PDF. It might be a scanned image or protected.");
     }
@@ -277,22 +329,23 @@ async function startServer() {
     const limitedSentences = sentences.slice(0, 400);
     const translatedSentences = [];
 
-    const batchSize = 5;
+    const batchSize = 15; // Group sentences into larger paragraphs
     for (let i = 0; i < limitedSentences.length; i += batchSize) {
       const batch = limitedSentences.slice(i, i + batchSize);
-      const batchResults = await Promise.all(batch.map(async (sentence) => {
-        try {
-          return await translateText(sentence, sourceLang, targetLang);
-        } catch {
-          return sentence;
-        }
-      }));
-      translatedSentences.push(...batchResults);
-      await sleep(250); // Optimized delay for stability
+      const paragraph = batch.join(" "); // Send as one block
       
-      const p = 20 + Math.floor((translatedSentences.length / limitedSentences.length) * 65);
+      try {
+        const translatedParagraph = await translateText(paragraph, sourceLang, targetLang);
+        translatedSentences.push(translatedParagraph);
+      } catch {
+        translatedSentences.push(paragraph);
+      }
+      
+      await sleep(1000); // 1 second delay between requests to strongly respect rate limits
+      
+      const p = 20 + Math.floor((i / limitedSentences.length) * 65);
       updateJob(jobId, { 
-        status: `Translating (${translatedSentences.length}/${limitedSentences.length})...`, 
+        status: `Translating (${i + batch.length}/${limitedSentences.length})...`, 
         progress: p 
       });
     }
@@ -300,6 +353,7 @@ async function startServer() {
     updateJob(jobId, { status: "Preparing final document...", progress: 90 });
     
     const pdfDoc = await PDFDocument.create();
+    pdfDoc.registerFontkit(fontkit);
     let page = pdfDoc.addPage();
     
     const isIndic = targetLang === 'ne' || targetLang === 'tmg';
@@ -307,7 +361,12 @@ async function startServer() {
     let font;
     
     if (preferredBuffer) {
-      font = await pdfDoc.embedFont(preferredBuffer);
+      try {
+        font = await pdfDoc.embedFont(preferredBuffer);
+      } catch (err) {
+        console.error("Failed to embed custom font:", err);
+        font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      }
     } else {
       font = await pdfDoc.embedFont(StandardFonts.Helvetica);
     }
@@ -319,8 +378,30 @@ async function startServer() {
     const wrapWidth = pageWidth - 2 * margin;
     let y = pageHeight - margin;
 
+    const charCache = new Map<string, boolean>();
+    const cleanTextString = (str: string) => {
+      let cleaned = "";
+      for (const char of str) {
+        if (!charCache.has(char)) {
+          try {
+            font.widthOfTextAtSize(char, fontSize);
+            charCache.set(char, true);
+          } catch {
+            charCache.set(char, false);
+          }
+        }
+        if (charCache.get(char)) {
+          cleaned += char;
+        } else {
+          cleaned += " ";
+        }
+      }
+      return cleaned;
+    };
+
     const wrapText = (text: string, width: number) => {
-      const words = text.split(/\s+/);
+      const cleanedText = cleanTextString(text);
+      const words = cleanedText.split(/\s+/);
       const lines = [];
       let currentLine = words[0] || "";
       for (let i = 1; i < words.length; i++) {
@@ -358,7 +439,7 @@ async function startServer() {
             color: rgb(0, 0, 0),
           });
         } catch (drawErr) {
-          console.warn("[PDF Draw Error] Character issue in line, skipping parts.");
+          console.warn("[PDF Draw Error] Character issue in line:", drawErr);
         }
         y -= fontSize + 5;
       }
