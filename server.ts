@@ -14,14 +14,25 @@ import fontkit from "@pdf-lib/fontkit";
 import { v4 as uuidv4 } from "uuid";
 import { GoogleGenAI } from "@google/genai";
 import axios from "axios";
+import mammoth from "mammoth";
+import { Document as DocxDocument, Paragraph as DocxParagraph, TextRun as DocxTextRun, Packer as DocxPacker } from "docx";
 
 let aiClient: GoogleGenAI | null = null;
-function getAI() {
-  if (!aiClient) {
-    if (!process.env.GEMINI_API_KEY) {
-      throw new Error("GEMINI_API_KEY environment variable is required.");
-    }
-    aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+let currentKey: string | undefined;
+
+function getAI(apiKey?: string) {
+  const keyToUse = 
+    apiKey || 
+    process.env.GOOGLE_API_KEY || 
+    process.env.GEMINI_API_KEY;
+  
+  if (!keyToUse) {
+    throw new Error("A valid GEMINI_API_KEY or GOOGLE_API_KEY environment variable is required.");
+  }
+  
+  if (!aiClient || currentKey !== keyToUse) {
+    currentKey = keyToUse;
+    aiClient = new GoogleGenAI({ apiKey: keyToUse });
   }
   return aiClient;
 }
@@ -56,6 +67,7 @@ function updateJob(id: string, updates: Partial<TranslationJob>) {
         error: updated.error,
         id: updated.id
       })}\n\n`);
+      if (typeof res.flush === 'function') res.flush();
     }
 
     // Fallback cleanup to prevent memory leaks if client disconnects
@@ -73,7 +85,7 @@ function updateJob(id: string, updates: Partial<TranslationJob>) {
 /**
  * Advanced Script-based AI Translation using Gemini
  */
-const translateText = async (text: string, source_lang: string, target_lang: string): Promise<string> => {
+const translateText = async (text: string, source_lang: string, target_lang: string, apiKey?: string): Promise<string> => {
   if (!text || typeof text !== 'string' || !text.trim()) return text;
   
   const langMap: Record<string, string> = {
@@ -92,18 +104,24 @@ const translateText = async (text: string, source_lang: string, target_lang: str
     Text to translate:
     ${text}`;
 
-    const response = await getAI().models.generateContent({
+    console.log(`[translateText] Source: ${srcLib}, Target: ${tgtLib}`);
+    console.log(`[translateText] Length to translate: ${text.length}`);
+    console.log(`[translateText] Used API Key from request: ${!!apiKey}`);
+
+    const response = await getAI(apiKey).models.generateContent({
       model: "gemini-2.5-flash",
       contents: prompt
     });
 
     if (response.text) {
+      console.log(`[translateText] Success: translated output length ${response.text.trim().length}`);
       return response.text.trim();
     }
-    return text;
+    console.warn(`[translateText] Warning: response.text is empty or undefined.`);
+    throw new Error("Response text from Gemini was empty or undefined.");
   } catch (error: any) {
     console.error(`[Gemini Neural Translation Error]:`, error.message);
-    return text; // Fallback to original text if translation fails
+    throw error;
   }
 };
 
@@ -155,6 +173,7 @@ async function startServer() {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // Prevent NGINX buffering
 
     clients.set(jobId, res);
 
@@ -168,6 +187,9 @@ async function startServer() {
       status: job.status,
       id: job.id 
     })}\n\n`);
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
   });
 
   // Download endpoint
@@ -196,6 +218,7 @@ async function startServer() {
     const file = req.file;
     const targetLang = req.body.target_lang || "ne";
     const sourceLang = req.body.source_lang || "en";
+    const apiKey = req.body.api_key;
 
     if (!file) return res.status(400).send("No file uploaded");
 
@@ -215,9 +238,11 @@ async function startServer() {
     (async () => {
       try {
         if (ext === "csv") {
-          await processCsvJob(jobId, file, sourceLang, targetLang);
+          await processCsvJob(jobId, file, sourceLang, targetLang, apiKey);
         } else if (ext === "pdf") {
-          await processPdfJob(jobId, file, sourceLang, targetLang);
+          await processPdfJob(jobId, file, sourceLang, targetLang, apiKey);
+        } else if (ext === "docx" || ext === "doc") {
+          await processDocxJob(jobId, file, sourceLang, targetLang, apiKey);
         } else {
           updateJob(jobId, { status: "Unsupported file type", progress: 100, error: "Unsupported format" });
         }
@@ -228,7 +253,7 @@ async function startServer() {
     })();
   });
 
-  async function processCsvJob(jobId: string, file: any, sourceLang: string, targetLang: string) {
+  async function processCsvJob(jobId: string, file: any, sourceLang: string, targetLang: string, apiKey?: string) {
     updateJob(jobId, { status: "Parsing CSV...", progress: 10 });
     const csvContent = file.buffer.toString();
     const records = parseCsv(csvContent, { columns: true, skip_empty_lines: true, relax_column_count: true });
@@ -246,7 +271,7 @@ async function startServer() {
         // Specialized prompt for objects
         const prompt = `Translate the VALUES of this JSON object from ${sourceLang} to ${targetLang}, but keep the KEYS exactly as they are in English. Return ONLY the raw valid JSON object without markdown formatting:\n${textToTranslate}`;
         
-        const response = await getAI().models.generateContent({
+        const response = await getAI(apiKey).models.generateContent({
            model: "gemini-2.5-flash",
            contents: prompt
         });
@@ -259,8 +284,9 @@ async function startServer() {
               newRow = parsed;
            }
         }
-      } catch (err) {
-        console.warn("[CSV Translation Row Fallback]");
+      } catch (err: any) {
+        console.error(`[Job ${jobId}] CSV Translation Row Error:`, err.message);
+        throw new Error(`Translation engine failed: ${err.message}`);
       }
       
       translatedRecords.push(newRow);
@@ -279,7 +305,7 @@ async function startServer() {
     });
   }
 
-  async function processPdfJob(jobId: string, file: any, sourceLang: string, targetLang: string) {
+  async function processPdfJob(jobId: string, file: any, sourceLang: string, targetLang: string, apiKey?: string) {
     updateJob(jobId, { status: "Extracting PDF content...", progress: 5 });
     
     let extractedText = "";
@@ -315,8 +341,11 @@ async function startServer() {
     }
 
     if (!extractedText || !extractedText.trim()) {
+      console.error(`[Job ${jobId}] Extracted text is empty fallback.`);
       throw new Error("No readable text found in the PDF. It might be a scanned image or protected.");
     }
+    
+    console.log(`[Job ${jobId}] Extracted ${extractedText.length} characters from PDF.`);
 
     updateJob(jobId, { status: "Analyzing structure...", progress: 15 });
 
@@ -324,6 +353,8 @@ async function startServer() {
       .split(/(?<=[.!?])\s+|\n+/)
       .map(s => s.trim())
       .filter(s => s.length > 2);
+      
+    console.log(`[Job ${jobId}] Parsed into ${sentences.length} sentences.`);
       
     // Reasonable limit for real-time processing
     const limitedSentences = sentences.slice(0, 400);
@@ -334,11 +365,15 @@ async function startServer() {
       const batch = limitedSentences.slice(i, i + batchSize);
       const paragraph = batch.join(" "); // Send as one block
       
+      console.log(`[Job ${jobId}] Translating batch (${i} to ${i + batch.length}): length ${paragraph.length}`);
+      
       try {
-        const translatedParagraph = await translateText(paragraph, sourceLang, targetLang);
+        const translatedParagraph = await translateText(paragraph, sourceLang, targetLang, apiKey);
         translatedSentences.push(translatedParagraph);
-      } catch {
-        translatedSentences.push(paragraph);
+        console.log(`[Job ${jobId}] Batch translated successfully. Length: ${translatedParagraph.length}`);
+      } catch (err: any) {
+        console.error(`[Job ${jobId}] Batch translation error:`, err.message);
+        throw new Error(`Translation engine failed: ${err.message}`);
       }
       
       await sleep(1000); // 1 second delay between requests to strongly respect rate limits
@@ -382,18 +417,32 @@ async function startServer() {
     const cleanTextString = (str: string) => {
       let cleaned = "";
       for (const char of str) {
-        if (!charCache.has(char)) {
-          try {
-            font.widthOfTextAtSize(char, fontSize);
-            charCache.set(char, true);
-          } catch {
-            charCache.set(char, false);
-          }
-        }
-        if (charCache.get(char)) {
-          cleaned += char;
-        } else {
+        if (char === "\n" || char === "\r") {
           cleaned += " ";
+          continue;
+        }
+        
+        let canRender = true;
+        // Test with both fonts if available
+        if (!charCache.has(char)) {
+          let hasGlyph = false;
+          try {
+             font.widthOfTextAtSize(char, fontSize);
+             hasGlyph = true;
+          } catch {
+             hasGlyph = false;
+          }
+          charCache.set(char, hasGlyph);
+        }
+        
+        canRender = charCache.get(char) || false;
+
+        // Rather than skipping space/basic punctuation that might be missing in custom font,
+        // we can forcibly just append it or fallback.
+        if (canRender || char.match(/[a-zA-Z0-9\s.,?!'"()-]/)) {
+          cleaned += char; // Keep basic Latin and renderable chars
+        } else {
+          cleaned += ""; // Omit totally unrenderable characters instead of replacing with space, so words aren't shattered
         }
       }
       return cleaned;
@@ -457,6 +506,90 @@ async function startServer() {
 
   // Remove the old endpoints
 
+  async function processDocxJob(jobId: string, file: any, sourceLang: string, targetLang: string, apiKey?: string) {
+    updateJob(jobId, { status: "Extracting DOCX content...", progress: 5 });
+    
+    let extractedText = "";
+    try {
+      const result = await mammoth.extractRawText({ buffer: file.buffer });
+      extractedText = result.value;
+    } catch (extractErr: any) {
+      console.error("[DOCX Extraction Error]:", extractErr.message);
+      throw new Error(`Failed to extract text from DOCX: ${extractErr.message}`);
+    }
+
+    if (!extractedText || !extractedText.trim()) {
+      console.error(`[Job ${jobId}] Extracted text is empty fallback.`);
+      throw new Error("No readable text found in the DOCX file.");
+    }
+    
+    console.log(`[Job ${jobId}] Extracted ${extractedText.length} characters from DOCX.`);
+
+    updateJob(jobId, { status: "Analyzing structure...", progress: 15 });
+
+    const sentences = extractedText
+      .split(/(?<=[.!?])\s+|\n+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 2);
+      
+    console.log(`[Job ${jobId}] Parsed into ${sentences.length} sentences.`);
+      
+    const limitedSentences = sentences.slice(0, 400);
+    const translatedSentences = [];
+
+    const batchSize = 15;
+    for (let i = 0; i < limitedSentences.length; i += batchSize) {
+      const batch = limitedSentences.slice(i, i + batchSize);
+      const paragraph = batch.join(" ");
+      
+      console.log(`[Job ${jobId}] Translating batch (${i} to ${i + batch.length}): length ${paragraph.length}`);
+      
+      try {
+        const translatedParagraph = await translateText(paragraph, sourceLang, targetLang, apiKey);
+        translatedSentences.push(translatedParagraph);
+        console.log(`[Job ${jobId}] Batch translated successfully. Length: ${translatedParagraph.length}`);
+      } catch (err: any) {
+        console.error(`[Job ${jobId}] Batch translation error:`, err.message);
+        throw new Error(`Translation engine failed: ${err.message}`);
+      }
+      
+      await sleep(1000); // respect rate limits
+      
+      const p = 20 + Math.floor((i / limitedSentences.length) * 65);
+      updateJob(jobId, { 
+        status: `Translating (${i + batch.length}/${limitedSentences.length})...`, 
+        progress: p 
+      });
+    }
+
+    updateJob(jobId, { status: "Preparing final document...", progress: 90 });
+    
+    // Create new DOCX Document
+    const paragraphs = translatedSentences.map(text => 
+      new DocxParagraph({
+        children: [new DocxTextRun({ text })]
+      })
+    );
+
+    const doc = new DocxDocument({
+      sections: [
+        {
+          properties: {},
+          children: paragraphs
+        }
+      ]
+    });
+
+    const docxBuffer = await DocxPacker.toBuffer(doc);
+    
+    updateJob(jobId, { 
+      status: "Complete", 
+      progress: 100, 
+      result: docxBuffer, 
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" 
+    });
+  }
+
   // Health Check
   app.get("/api/ping", (req, res) => {
     res.json({ status: "ok", engine: "Node.js (Real TMT)", timestamp: new Date().toISOString() });
@@ -465,7 +598,7 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: "spa",
     });
     app.use(vite.middlewares);

@@ -38,13 +38,15 @@ const LANGUAGES: Language[] = [
 ];
 
 export default function App() {
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [sourceLang, setSourceLang] = useState<string>("en");
   const [targetLang, setTargetLang] = useState<string>("ne");
   const [isTranslating, setIsTranslating] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [statusText, setStatusText] = useState("");
-  const [result, setResult] = useState<{ url: string; name: string } | null>(null);
+  
+  // Track individual jobs
+  const [jobsState, setJobsState] = useState<{ [id: string]: { name: string, status: string, progress: number, url?: string, error?: string } }>({});
+  
   const [error, setError] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -59,92 +61,121 @@ export default function App() {
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    const droppedFile = e.dataTransfer.files[0];
-    if (droppedFile) validateAndSetFile(droppedFile);
-  }, []);
+    const droppedFiles = Array.from(e.dataTransfer.files);
+    if (droppedFiles.length > 0) validateAndSetFiles(droppedFiles);
+  }, [isBatchMode]);
 
-  const validateAndSetFile = (f: File) => {
-    const ext = f.name.split('.').pop()?.toLowerCase();
-    if (['csv', 'docx', 'pdf'].includes(ext || '')) {
-      setSelectedFile(f);
+  const validateAndSetFiles = (files: File[]) => {
+    let validFiles = files.filter(f => {
+      const ext = f.name.split('.').pop()?.toLowerCase();
+      return ['csv', 'docx', 'pdf'].includes(ext || '');
+    });
+
+    if (validFiles.length > 0) {
+      if (!isBatchMode) {
+        validFiles = [validFiles[0]];
+      }
+      setSelectedFiles(prev => {
+        if (!isBatchMode) return validFiles;
+        // avoid duplicates based on name
+        const newFiles = validFiles.filter(vf => !prev.some(pf => pf.name === vf.name));
+        return [...prev, ...newFiles];
+      });
       setError(null);
-      setResult(null);
-      setProgress(0);
-      setStatusText("");
     } else {
-      setError("Please upload a .csv, .docx, or .pdf file.");
+      setError("Please upload .csv, .docx, or .pdf files.");
     }
+  };
+
+  const toggleBatchMode = () => {
+    setIsBatchMode(prev => {
+      const next = !prev;
+      if (!next && selectedFiles.length > 1) {
+        setSelectedFiles([selectedFiles[0]]);
+      }
+      return next;
+    });
   };
 
   const handleUpload = async () => {
-    if (!selectedFile) return;
+    if (selectedFiles.length === 0) return;
     setIsTranslating(true);
     setError(null);
-    setProgress(0);
-    setStatusText("Initializing engine...");
+    setJobsState({});
 
-    const formData = new FormData();
-    formData.append("file", selectedFile);
-    formData.append("target_lang", targetLang);
-    formData.append("source_lang", sourceLang);
+    for (const file of selectedFiles) {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("target_lang", targetLang);
+      formData.append("source_lang", sourceLang);
+      formData.append("api_key", process.env.GEMINI_API_KEY || "");
 
-    const extension = selectedFile.name.split('.').pop()?.toLowerCase();
-    const endpoint = `/api/translate/${extension}`;
+      const extension = file.name.split('.').pop()?.toLowerCase();
+      const endpoint = `/api/translate/${extension}`;
 
-    try {
-      const triggerResponse = await fetch(endpoint, {
-        method: "POST",
-        body: formData,
-      });
+      try {
+        const triggerResponse = await fetch(endpoint, {
+          method: "POST",
+          body: formData,
+        });
 
-      if (!triggerResponse.ok) {
-        const errorData = await triggerResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || errorData.details || "Failed to start translation.");
+        if (!triggerResponse.ok) {
+          console.error("Upload error for file", file.name);
+          continue;
+        }
+
+        const { jobId } = await triggerResponse.json();
+        
+        setJobsState(prev => ({
+          ...prev,
+          [jobId]: { name: file.name, status: "Starting...", progress: 0 }
+        }));
+
+        const eventSource = new EventSource(`/api/jobs/progress/${jobId}`);
+
+        eventSource.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          
+          setJobsState(prev => {
+            const newState = { ...prev };
+            if (newState[jobId]) {
+              newState[jobId] = { 
+                ...newState[jobId],
+                progress: data.progress,
+                status: data.error ? data.error : (data.status || "Processing..."),
+                error: data.error
+              };
+            }
+            return newState;
+          });
+
+          if (data.progress === 100) {
+            eventSource.close();
+            if (!data.error) {
+              setJobsState(prev => ({
+                ...prev,
+                [jobId]: { ...prev[jobId], url: `/api/jobs/download/${jobId}` }
+              }));
+            }
+          }
+        };
+
+        eventSource.onerror = () => {
+          eventSource.close();
+          setJobsState(prev => ({
+            ...prev,
+            [jobId]: { ...prev[jobId], error: "Connection lost", progress: 100 }
+          }));
+        };
+
+      } catch (err: any) {
+        console.error(err);
       }
-
-      const { jobId } = await triggerResponse.json();
-      const eventSource = new EventSource(`/api/jobs/progress/${jobId}`);
-
-      eventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.error) {
-          setError(data.error);
-          eventSource.close();
-          setIsTranslating(false);
-          return;
-        }
-        setProgress(data.progress);
-        setStatusText(data.status);
-        if (data.progress === 100 && data.status === "Complete") {
-          eventSource.close();
-          finishJob(jobId);
-        }
-      };
-
-      eventSource.onerror = () => {
-        eventSource.close();
-      };
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-      setIsTranslating(false);
     }
   };
 
-  const finishJob = async (jobId: string) => {
-    try {
-      const downloadUrl = `/api/jobs/download/${jobId}`;
-      const response = await fetch(downloadUrl);
-      if (!response.ok) throw new Error("Could not download translated file.");
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const translatedName = `translated_${selectedFile?.name}`;
-      setResult({ url, name: translatedName });
-      setIsTranslating(false);
-    } catch (err: any) {
-      setError(err.message);
-      setIsTranslating(false);
-    }
-  };
+  const isAnyTranslating = isTranslating && Object.values(jobsState).some(j => j.progress < 100 && !j.error);
+  const isAllComplete = isTranslating && Object.values(jobsState).length > 0 && Object.values(jobsState).every(j => j.progress === 100);
 
   return (
     <div ref={containerRef} className="min-h-screen bg-black font-sans text-slate-400 selection:bg-brand-500 selection:text-white overflow-x-hidden">
@@ -343,62 +374,64 @@ export default function App() {
                 <div 
                   onDragOver={(e) => e.preventDefault()}
                   onDrop={onDrop}
-                  className={`group relative min-h-[300px] border-2 border-dashed rounded-[32px] transition-all flex flex-col items-center justify-center p-8 text-center ${
-                    selectedFile 
+                  className={`group relative min-h-[250px] border-2 border-dashed rounded-[32px] transition-all flex flex-col items-center justify-center p-8 text-center ${
+                    selectedFiles.length > 0 
                     ? 'border-brand-500/50 bg-brand-500/5' 
                     : 'border-white/10 hover:border-brand-500/50 hover:bg-white/5'
                   }`}
                 >
-                  <AnimatePresence mode="wait">
-                    {!selectedFile ? (
-                      <motion.label 
-                        key="upload"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="cursor-pointer flex flex-col items-center gap-6"
-                      >
-                        <input 
-                          type="file" 
-                          className="hidden" 
-                          accept=".csv,.docx,.pdf"
-                          onChange={(e) => e.target.files?.[0] && validateAndSetFile(e.target.files[0])}
-                        />
-                        <div className="relative">
-                          <div className="absolute -inset-4 bg-brand-500/20 blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
-                          <div className="relative w-20 h-20 bg-white/5 glass rounded-[24px] flex items-center justify-center text-slate-400 group-hover:text-brand-400 transition-colors">
-                            <Upload className="w-10 h-10" />
-                          </div>
-                        </div>
-                        <div>
-                          <p className="text-xl font-bold text-white mb-2 font-display">Ingest Document</p>
-                          <p className="text-sm text-slate-500">PDF, DOCX, or CSV. Max 50MB per session.</p>
-                        </div>
-                      </motion.label>
-                    ) : (
-                      <motion.div 
-                        key="file"
-                        initial={{ opacity: 0, scale: 0.9 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className="w-full flex flex-col items-center gap-6"
-                      >
-                        <div className="w-20 h-20 bg-emerald-500/10 border border-emerald-500/30 rounded-[24px] flex items-center justify-center text-emerald-400">
-                          <FileText className="w-10 h-10" />
-                        </div>
-                        <div className="max-w-[80%]">
-                          <p className="text-lg font-bold text-white truncate">{selectedFile.name}</p>
-                          <p className="text-xs text-slate-500 mt-1 uppercase tracking-widest font-bold">{(selectedFile.size / 1024).toFixed(1)} KB &bull; Verified</p>
-                        </div>
-                        <button 
-                          onClick={() => setSelectedFile(null)}
-                          className="px-4 py-2 rounded-full glass border-red-500/20 text-red-400 text-[10px] font-bold uppercase tracking-wider hover:bg-red-500/10 transition-colors"
-                        >
-                          Eject File
-                        </button>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
+                  <label className="cursor-pointer flex flex-col items-center gap-4">
+                    <input 
+                      type="file" 
+                      className="hidden" 
+                      accept=".csv,.docx,.pdf"
+                      multiple={isBatchMode}
+                      onChange={(e) => e.target.files && validateAndSetFiles(Array.from(e.target.files))}
+                    />
+                    <div className="relative">
+                      <div className="absolute -inset-4 bg-brand-500/20 blur-xl opacity-0 group-hover:opacity-100 transition-opacity" />
+                      <div className="relative w-16 h-16 bg-white/5 glass rounded-[20px] flex items-center justify-center text-slate-400 group-hover:text-brand-400 transition-colors">
+                        <Upload className="w-8 h-8" />
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-xl font-bold text-white mb-1 font-display">{isBatchMode ? "Ingest Documents" : "Ingest Document"}</p>
+                      <p className="text-sm text-slate-500">
+                        PDF, DOCX, or CSV. {isBatchMode ? "Batch upload supported." : "Max 50MB per session."}
+                      </p>
+                    </div>
+                  </label>
                 </div>
+
+                <div className="flex items-center gap-3 px-2">
+                  <button 
+                    type="button"
+                    onClick={toggleBatchMode} 
+                    className={`relative w-10 h-6 rounded-full transition-colors ${isBatchMode ? 'bg-brand-500' : 'bg-white/10'}`}
+                  >
+                    <span className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${isBatchMode ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </button>
+                  <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">Enable Batch Mode</span>
+                </div>
+
+                {selectedFiles.length > 0 && !isTranslating && Object.keys(jobsState).length === 0 && (
+                  <div className="space-y-3">
+                    <div className="flex justify-between items-center text-xs font-bold text-slate-400">
+                      <span>{selectedFiles.length} files selected</span>
+                      <button onClick={() => setSelectedFiles([])} className="hover:text-white transition-colors uppercase tracking-widest text-[10px]">Clear all</button>
+                    </div>
+                    <div className="max-h-48 overflow-y-auto space-y-2 pr-2">
+                       {selectedFiles.map((f, i) => (
+                         <div key={i} className="flex justify-between items-center bg-white/5 p-3 rounded-xl border border-white/10">
+                            <span className="text-white text-sm truncate pr-4">{f.name}</span>
+                            <button onClick={() => setSelectedFiles(prev => prev.filter((_, idx) => idx !== i))} className="text-red-400 hover:text-red-300">
+                               <X className="w-4 h-4" />
+                            </button>
+                         </div>
+                       ))}
+                    </div>
+                  </div>
+                )}
 
                 <div className="space-y-6">
                   {error && (
@@ -408,80 +441,76 @@ export default function App() {
                     </div>
                   )}
 
-                  {!result ? (
+                  {!isTranslating && Object.keys(jobsState).length === 0 ? (
                     <div className="space-y-6">
                       <button
-                        disabled={!selectedFile || isTranslating}
+                        disabled={selectedFiles.length === 0}
                         onClick={handleUpload}
                         className={`w-full py-5 rounded-[24px] font-display text-lg font-bold flex items-center justify-center gap-3 transition-all relative overflow-hidden ${
-                          !selectedFile || isTranslating
+                          selectedFiles.length === 0
                           ? 'bg-white/5 text-slate-600 grayscale'
                           : 'bg-gradient-to-r from-brand-500 to-indigo-600 text-white shadow-2xl shadow-brand-500/20 hover:scale-[1.02] active:scale-[0.98]'
                         }`}
                       >
-                        {isTranslating ? (
-                          <>
-                            <Loader2 className="w-6 h-6 animate-spin" />
-                            Processing Neural Sequence...
-                          </>
-                        ) : (
-                          <>
-                            Trigger Translation Engine
-                            <Zap className="w-5 h-5 fill-current" />
-                          </>
-                        )}
+                        Trigger Translation Engine
+                        <Zap className="w-5 h-5 fill-current" />
                       </button>
-
-                      {isTranslating && (
-                        <div className="space-y-3">
-                          <div className="flex justify-between items-center text-[11px] uppercase tracking-widest font-black text-slate-500">
-                            <span className="flex items-center gap-2">
-                              <span className="flex h-2 w-2 rounded-full bg-brand-500 animate-pulse" />
-                              {statusText}
-                            </span>
-                            <span className="text-brand-400">{Math.round(progress)}%</span>
-                          </div>
-                          <div className="h-2 w-full bg-white/5 rounded-full overflow-hidden p-[1px]">
-                            <motion.div 
-                              className="h-full bg-gradient-to-r from-brand-500 via-indigo-500 to-purple-500 rounded-full shadow-[0_0_15px_rgba(12,142,255,0.5)]"
-                              initial={{ width: 0 }}
-                              animate={{ width: `${progress}%` }}
-                              transition={{ duration: 0.1 }}
-                            />
-                          </div>
-                        </div>
-                      )}
                     </div>
                   ) : (
-                    <motion.div 
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="space-y-4"
-                    >
-                      <div className="p-6 rounded-[32px] bg-emerald-500/5 border border-emerald-500/20 flex items-center gap-4">
-                        <div className="w-12 h-12 bg-emerald-500 rounded-full flex items-center justify-center">
-                          <CheckCircle2 className="w-6 h-6 text-white" />
-                        </div>
-                        <div>
-                          <p className="text-white font-bold text-lg">Translation Ready</p>
-                          <p className="text-emerald-400/70 text-xs uppercase font-black tracking-widest">Structural analysis pass: 100%</p>
-                        </div>
+                    <div className="space-y-6">
+                      <div className="flex justify-between items-center text-white pb-2 border-b border-white/10">
+                        <h3 className="font-bold text-lg">Batch Process</h3>
+                        {isAllComplete && (
+                          <button 
+                            onClick={() => { setJobsState({}); setSelectedFiles([]); setIsTranslating(false); }}
+                            className="text-xs font-bold uppercase tracking-widest text-emerald-400 hover:text-emerald-300"
+                          >
+                            Start New Batch
+                          </button>
+                        )}
                       </div>
-                      <a
-                        href={result.url}
-                        download={result.name}
-                        className="w-full py-5 bg-white text-black rounded-[24px] font-display font-bold text-lg flex items-center justify-center gap-3 hover:bg-emerald-400 transition-all"
-                      >
-                        <Download className="w-6 h-6" />
-                        Download Translated Result
-                      </a>
-                      <button 
-                        onClick={() => { setResult(null); setSelectedFile(null); }}
-                        className="w-full py-3 text-slate-500 text-xs font-bold uppercase tracking-widest hover:text-white transition-colors"
-                      >
-                        Reset Workspace
-                      </button>
-                    </motion.div>
+                      
+                      <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2">
+                        {Object.entries(jobsState).map(([jId, job]) => (
+                          <div key={jId} className="p-4 rounded-2xl bg-white/5 border border-white/10 space-y-3">
+                            <div className="flex justify-between items-center">
+                              <span className="text-white text-sm font-medium truncate max-w-[60%]">{job.name}</span>
+                              <span className={`text-[10px] uppercase font-black tracking-widest ${job.error ? 'text-red-400' : job.progress === 100 ? 'text-emerald-400' : 'text-brand-400'}`}>
+                                {job.error ? 'Error' : job.progress === 100 ? 'Complete' : `${Math.round(job.progress)}%`}
+                              </span>
+                            </div>
+                            
+                            {!job.error && job.progress < 100 && (
+                              <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
+                                <motion.div 
+                                  className="h-full bg-gradient-to-r from-brand-500 to-indigo-500 rounded-full"
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${job.progress}%` }}
+                                />
+                              </div>
+                            )}
+
+                            {job.error && (
+                              <p className="text-xs text-red-500/80">{job.error}</p>
+                            )}
+                            
+                            {!job.error && job.progress < 100 && (
+                              <p className="text-xs text-slate-500 truncate">{job.status}</p>
+                            )}
+
+                            {job.progress === 100 && !job.error && job.url && (
+                              <a
+                                href={job.url}
+                                download={`translated_${job.name}`}
+                                className="block w-full py-2.5 mt-2 bg-white/10 text-white rounded-xl font-bold text-xs text-center flex items-center justify-center gap-2 hover:bg-emerald-500 hover:text-white transition-all pointer-events-auto"
+                              >
+                                <Download className="w-4 h-4" /> Download Result
+                              </a>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
